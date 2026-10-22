@@ -12,6 +12,7 @@
 #include <linux/i2c.h>
 #include <linux/input.h>
 #include <linux/module.h>
+#include <linux/minmax.h>
 #include <linux/platform_device.h>
 #include <linux/slab.h>
 #include <sound/jack.h>
@@ -51,13 +52,42 @@
 #define SOF_ES8336_HEADPHONE_GPIO		BIT(7)
 #define SOC_ES8336_HEADSET_MIC1			BIT(8)
 #define SOF_ES8336_HEADPHONE_GPIO_NON_INVERTED	BIT(9)
-#define SOF_ES8336_DISABLE_DMIC			BIT(10)
+
+/*
+ * Number of HDMI/DP front-end PCMs to expose.
+ *
+ * The shipped sof-<plat>-es8336-*.tplg topologies always describe three HDMI
+ * pipelines, but the number of display outputs of a platform is not
+ * necessarily three. A DP/HDMI converter without a usable FE PCM behind it
+ * makes the DSP reject the stream setup with -EIO, which shows up as a flood
+ * of "STREAM_PCM_PARAMS ipc failed" errors on every session start.
+ *
+ * This value must match the number of HDMI/DP BACKEND_LINK blocks in the
+ * topology, otherwise the topology fails to load and the card never
+ * registers.
+ *
+ * A field value of 0 means "not specified", the default of 3 is then used.
+ */
+#define SOF_ES8336_HDMI_NUM_SHIFT		17
+#define SOF_ES8336_HDMI_NUM_MASK		(GENMASK(18, 17))
+#define SOF_ES8336_HDMI_NUM(quirk)		\
+	(((quirk) & SOF_ES8336_HDMI_NUM_MASK) >> SOF_ES8336_HDMI_NUM_SHIFT)
+#define SOF_ES8336_HDMI_NUM_2			(2 << SOF_ES8336_HDMI_NUM_SHIFT)
 
 static unsigned long quirk;
 
 static int quirk_override = -1;
 module_param_named(quirk, quirk_override, int, 0444);
-MODULE_PARM_DESC(quirk, "Board-specific quirk override");
+MODULE_PARM_DESC(quirk,
+		 "Board-specific quirk override. The HDMI/DP FE PCM count "
+		 "provided by DMI is preserved, use the hdmi_num parameter "
+		 "to change it.");
+
+static int hdmi_num_override = -1;
+module_param_named(hdmi_num, hdmi_num_override, int, 0444);
+MODULE_PARM_DESC(hdmi_num,
+		 "Number of HDMI/DP FE PCMs (1-3, 0 for none). Default 3. "
+		 "Platforms with fewer or more display outputs should override this.");
 
 struct sof_es8336_private {
 	struct device *codec_dev;
@@ -114,6 +144,9 @@ static void log_quirks(struct device *dev)
 		dev_info(dev, "quirk JD inverted enabled\n");
 	if (quirk & SOC_ES8336_HEADSET_MIC1)
 		dev_info(dev, "quirk headset at mic1 port enabled\n");
+	if (SOF_ES8336_HDMI_NUM(quirk))
+		dev_info(dev, "quirk HDMI FE PCM count %lu\n",
+			 SOF_ES8336_HDMI_NUM(quirk));
 }
 
 static void pcm_pop_work_events(struct work_struct *work)
@@ -140,26 +173,22 @@ static int sof_8336_trigger(struct snd_pcm_substream *substream, int cmd)
 	case SNDRV_PCM_TRIGGER_START:
 	case SNDRV_PCM_TRIGGER_PAUSE_RELEASE:
 	case SNDRV_PCM_TRIGGER_RESUME:
-		if (priv->speaker_en == false) {
-			if (substream->stream == 0) {
-				queue_delayed_work(system_dfl_wq, &priv->pcm_pop_work,
-						   msecs_to_jiffies(70));
-			}
+		if (substream->stream == 0) {
+			mod_delayed_work(system_dfl_wq, &priv->pcm_pop_work,
+					 msecs_to_jiffies(70));
 		}
 		break;
 
 	case SNDRV_PCM_TRIGGER_PAUSE_PUSH:
 	case SNDRV_PCM_TRIGGER_SUSPEND:
 	case SNDRV_PCM_TRIGGER_STOP:
-		if (priv->speaker_en == false) {
-			if (substream->stream == 0) {
-				cancel_delayed_work_sync(&priv->pcm_pop_work);
-				gpiod_set_value_cansleep(priv->gpio_speakers, true);
-				if (quirk & SOF_ES8336_HEADPHONE_GPIO)
-					gpiod_set_value_cansleep(priv->gpio_headphone, false);
-				else if (quirk & SOF_ES8336_HEADPHONE_GPIO_NON_INVERTED)
-					gpiod_set_value_cansleep(priv->gpio_headphone, true);
-			}
+		if (substream->stream == 0) {
+			cancel_delayed_work_sync(&priv->pcm_pop_work);
+			gpiod_set_value_cansleep(priv->gpio_speakers, true);
+			if (quirk & SOF_ES8336_HEADPHONE_GPIO)
+				gpiod_set_value_cansleep(priv->gpio_headphone, false);
+			else if (quirk & SOF_ES8336_HEADPHONE_GPIO_NON_INVERTED)
+				gpiod_set_value_cansleep(priv->gpio_headphone, true);
 		}
 		break;
 	default:
@@ -366,9 +395,7 @@ static const struct dmi_system_id sof_es8336_quirk_table[] = {
 			DMI_MATCH(DMI_SYS_VENDOR, "Infinix"),
 			DMI_MATCH(DMI_PRODUCT_NAME, "Infinix INBOOK X2 PLUS"),
 		},
-		.driver_data = (void *)(SOF_ES8336_HEADPHONE_GPIO_NON_INVERTED |
-					SOF_ES8336_DISABLE_DMIC |
-					SOC_ES8336_HEADSET_MIC1)
+		.driver_data = (void *)(SOF_ES8336_HEADPHONE_GPIO_NON_INVERTED)
 	},
 	{
 		.callback = sof_es8336_quirk_cb,
@@ -377,8 +404,7 @@ static const struct dmi_system_id sof_es8336_quirk_table[] = {
 			DMI_MATCH(DMI_PRODUCT_NAME, "Infinix  INBOOK X2"),
 		},
 		.driver_data = (void *)(SOF_ES8336_HEADPHONE_GPIO_NON_INVERTED |
-					SOF_ES8336_DISABLE_DMIC |
-					SOC_ES8336_HEADSET_MIC1)
+					SOF_ES8336_HDMI_NUM_2)
 	},
 	{
 		.callback = sof_es8336_quirk_cb,
@@ -386,9 +412,15 @@ static const struct dmi_system_id sof_es8336_quirk_table[] = {
 			DMI_MATCH(DMI_SYS_VENDOR, "Infinix"),
 			DMI_MATCH(DMI_PRODUCT_NAME, "INBOOK X2 GEN11"),
 		},
-		.driver_data = (void *)(SOF_ES8336_HEADPHONE_GPIO_NON_INVERTED |
-					SOF_ES8336_DISABLE_DMIC |
-					SOC_ES8336_HEADSET_MIC1)
+		.driver_data = (void *)(SOF_ES8336_HEADPHONE_GPIO_NON_INVERTED)
+	},
+	{
+		.callback = sof_es8336_quirk_cb,
+		.matches = {
+			DMI_MATCH(DMI_SYS_VENDOR, "Infinix"),
+			DMI_MATCH(DMI_PRODUCT_NAME, "INBOOK X2 SLIM"),
+		},
+		.driver_data = (void *)(SOF_ES8336_HEADPHONE_GPIO_NON_INVERTED)
 	},
 	{
 		.callback = sof_es8336_quirk_cb,
@@ -396,9 +428,7 @@ static const struct dmi_system_id sof_es8336_quirk_table[] = {
 			DMI_MATCH(DMI_SYS_VENDOR, "Infinix"),
 			DMI_MATCH(DMI_PRODUCT_NAME, "Infinix INBOOK X1 SLIM"),
 		},
-		.driver_data = (void *)(SOF_ES8336_HEADPHONE_GPIO_NON_INVERTED |
-					SOF_ES8336_DISABLE_DMIC |
-					SOC_ES8336_HEADSET_MIC1)
+		.driver_data = (void *)(SOF_ES8336_HEADPHONE_GPIO_NON_INVERTED)
 	},
 	{
 		.callback = sof_es8336_quirk_cb,
@@ -406,9 +436,7 @@ static const struct dmi_system_id sof_es8336_quirk_table[] = {
 			DMI_MATCH(DMI_SYS_VENDOR, "Infinix"),
 			DMI_MATCH(DMI_PRODUCT_NAME, "Infinix INBOOK X1 NEO"),
 		},
-		.driver_data = (void *)(SOF_ES8336_HEADPHONE_GPIO_NON_INVERTED |
-					SOF_ES8336_DISABLE_DMIC |
-					SOC_ES8336_HEADSET_MIC1)
+		.driver_data = (void *)(SOF_ES8336_HEADPHONE_GPIO_NON_INVERTED)
 	},
 	{
 		.callback = sof_es8336_quirk_cb,
@@ -416,9 +444,7 @@ static const struct dmi_system_id sof_es8336_quirk_table[] = {
 			DMI_MATCH(DMI_SYS_VENDOR, "Infinix"),
 			DMI_MATCH(DMI_PRODUCT_NAME, "INBOOK Y1 PLUS"),
 		},
-		.driver_data = (void *)(SOF_ES8336_HEADPHONE_GPIO_NON_INVERTED |
-					SOF_ES8336_DISABLE_DMIC |
-					SOC_ES8336_HEADSET_MIC1)
+		.driver_data = (void *)(SOF_ES8336_HEADPHONE_GPIO_NON_INVERTED)
 	},
 	{
 		.callback = sof_es8336_quirk_cb,
@@ -426,9 +452,15 @@ static const struct dmi_system_id sof_es8336_quirk_table[] = {
 			DMI_MATCH(DMI_SYS_VENDOR, "Infinix"),
 			DMI_MATCH(DMI_PRODUCT_NAME, "INBOOK Y1 PLUS NEO"),
 		},
-		.driver_data = (void *)(SOF_ES8336_HEADPHONE_GPIO_NON_INVERTED |
-					SOF_ES8336_DISABLE_DMIC |
-					SOC_ES8336_HEADSET_MIC1)
+		.driver_data = (void *)(SOF_ES8336_HEADPHONE_GPIO_NON_INVERTED)
+	},
+	{
+		.callback = sof_es8336_quirk_cb,
+		.matches = {
+			DMI_MATCH(DMI_SYS_VENDOR, "Infinix"),
+			DMI_MATCH(DMI_PRODUCT_NAME, "INBOOK Y2 PLUS"),
+		},
+		.driver_data = (void *)(SOF_ES8336_HEADPHONE_GPIO_NON_INVERTED)
 	},
 	{
 		.callback = sof_es8336_quirk_cb,
@@ -706,7 +738,7 @@ static int sof_es8336_probe(struct platform_device *pdev)
 	const struct acpi_gpio_mapping *gpio_mapping;
 	unsigned int cnt = 0;
 	int dmic_be_num = 0;
-	int hdmi_num = 3;
+	int hdmi_num;
 	int ret;
 
 	priv = devm_kzalloc(dev, sizeof(*priv), GFP_KERNEL);
@@ -750,20 +782,40 @@ static int sof_es8336_probe(struct platform_device *pdev)
 		quirk |= SOF_ES8336_ENABLE_DMIC;
 
 	if (quirk_override != -1) {
+		unsigned long hdmi_num_quirk = quirk & SOF_ES8336_HDMI_NUM_MASK;
+
 		dev_info(dev, "Overriding quirk 0x%lx => 0x%x\n",
 			 quirk, quirk_override);
 		quirk = quirk_override;
-	}
 
-	if (quirk & SOF_ES8336_DISABLE_DMIC) {
-		mach->mach_params.dmic_num = 0;
-		quirk &= ~SOF_ES8336_ENABLE_DMIC;
+		/*
+		 * The HDMI/DP FE PCM count is a topology property rather than a
+		 * GPIO or jack-detection quirk, so keep the DMI provided value
+		 * when the quirk mask is overridden from the module parameter.
+		 * Use the hdmi_num module parameter to change it explicitly.
+		 */
+		quirk |= hdmi_num_quirk;
 	}
-
 	log_quirks(dev);
 
 	if (quirk & SOF_ES8336_ENABLE_DMIC)
 		dmic_be_num = 2;
+
+	/*
+	 * The number of HDMI/DP BE DAI links is hard-coded to 3 because that is
+	 * what the shipped sof-<plat>-es8336-*.tplg topologies describe.
+	 * Platforms with a different number of display outputs must override it,
+	 * and the matching topology must be used as well.
+	 */
+	hdmi_num = 3;
+	if (SOF_ES8336_HDMI_NUM(quirk)) {
+		hdmi_num = SOF_ES8336_HDMI_NUM(quirk);
+		dev_info(dev, "quirk HDMI FE PCM count %d\n", hdmi_num);
+	}
+	if (hdmi_num_override != -1) {
+		hdmi_num = clamp(hdmi_num_override, 0, 3);
+		dev_info(dev, "Overriding HDMI FE PCM count => %d\n", hdmi_num);
+	}
 
 	/* compute number of dai links */
 	sof_es8336_card.num_links = 1 + dmic_be_num + hdmi_num;
